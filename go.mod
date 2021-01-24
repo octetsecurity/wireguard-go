@@ -1,4 +1,5 @@
-module golang.zx2c4.com/wireguard
+module github.com/octetsecurity/wireguard-go
+
 
 go 1.15
 
