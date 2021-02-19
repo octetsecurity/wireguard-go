@@ -1,4 +1,4 @@
-module github.com/octetsecurity/wireguard-go/tun/netstack
+module golang.zx2c4.com/wireguard/tun/netstack
 
 go 1.15
 

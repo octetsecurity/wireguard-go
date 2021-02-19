@@ -1,8 +1,10 @@
+//+build race
+
 /* SPDX-License-Identifier: MIT
  *
  * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  */
 
-package memmod
+package device
 
-const imageFileProcess = IMAGE_FILE_MACHINE_ARMNT
+const raceEnabled = true

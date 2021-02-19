@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2020 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  *
  * This is based heavily on timers.c from the kernel implementation.
  */
@@ -14,10 +14,8 @@ import (
 	"time"
 )
 
-/* This Timer structure and related functions should roughly copy the interface of
- * the Linux kernel's struct timer_list.
- */
-
+// A Timer manages time-based aspects of the WireGuard protocol.
+// Timer roughly copies the interface of the Linux kernel's struct timer_list.
 type Timer struct {
 	*time.Timer
 	modifyingLock sync.RWMutex
@@ -73,12 +71,12 @@ func (timer *Timer) IsPending() bool {
 }
 
 func (peer *Peer) timersActive() bool {
-	return peer.isRunning.Get() && peer.device != nil && peer.device.isUp.Get() && !peer.device.peers.empty.Get()
+	return peer.isRunning.Get() && peer.device != nil && peer.device.isUp() && !peer.device.peers.empty.Get()
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
 	if atomic.LoadUint32(&peer.timers.handshakeAttempts) > MaxTimerHandshakes {
-		peer.device.log.Debug.Printf("%s - Handshake did not complete after %d attempts, giving up\n", peer, MaxTimerHandshakes+2)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -87,7 +85,7 @@ func expiredRetransmitHandshake(peer *Peer) {
 		/* We drop all packets without a keypair and don't try again,
 		 * if we try unsuccessfully for too long to make a handshake.
 		 */
-		peer.FlushNonceQueue()
+		peer.FlushStagedPackets()
 
 		/* We set a timer for destroying any residue that might be left
 		 * of a partial exchange.
@@ -97,7 +95,7 @@ func expiredRetransmitHandshake(peer *Peer) {
 		}
 	} else {
 		atomic.AddUint32(&peer.timers.handshakeAttempts, 1)
-		peer.device.log.Debug.Printf("%s - Handshake did not complete after %d seconds, retrying (try %d)\n", peer, int(RekeyTimeout.Seconds()), atomic.LoadUint32(&peer.timers.handshakeAttempts)+1)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), atomic.LoadUint32(&peer.timers.handshakeAttempts)+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.Lock()
@@ -121,7 +119,7 @@ func expiredSendKeepalive(peer *Peer) {
 }
 
 func expiredNewHandshake(peer *Peer) {
-	peer.device.log.Debug.Printf("%s - Retrying handshake because we stopped hearing back after %d seconds\n", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
+	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
 	/* We clear the endpoint address src address, in case this is the cause of trouble. */
 	peer.Lock()
 	if peer.endpoint != nil {
@@ -133,7 +131,7 @@ func expiredNewHandshake(peer *Peer) {
 }
 
 func expiredZeroKeyMaterial(peer *Peer) {
-	peer.device.log.Debug.Printf("%s - Removing all keys, since we haven't received a new one in %d seconds\n", peer, int((RejectAfterTime * 3).Seconds()))
+	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((RejectAfterTime * 3).Seconds()))
 	peer.ZeroAndFlushAll()
 }
 
@@ -213,6 +211,9 @@ func (peer *Peer) timersInit() {
 	peer.timers.newHandshake = peer.NewTimer(expiredNewHandshake)
 	peer.timers.zeroKeyMaterial = peer.NewTimer(expiredZeroKeyMaterial)
 	peer.timers.persistentKeepalive = peer.NewTimer(expiredPersistentKeepalive)
+}
+
+func (peer *Peer) timersStart() {
 	atomic.StoreUint32(&peer.timers.handshakeAttempts, 0)
 	peer.timers.sentLastMinuteHandshake.Set(false)
 	peer.timers.needAnotherKeepalive.Set(false)
