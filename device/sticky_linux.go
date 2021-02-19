@@ -2,7 +2,7 @@
 
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2020 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  *
  * This implements userspace semantics of "sticky sockets", modeled after
  * WireGuard's kernelspace implementation. This is more or less a straight port
@@ -49,6 +49,7 @@ func (device *Device) routineRouteListener(bind conn.Bind, netlinkSock int, netl
 	var reqPeer map[uint32]peerEndpointPtr
 	var reqPeerLock sync.Mutex
 
+	defer netlinkCancel.Close()
 	defer unix.Close(netlinkSock)
 
 	for msg := make([]byte, 1<<16); ; {

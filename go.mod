@@ -1,6 +1,5 @@
 module github.com/octetsecurity/wireguard-go
 
-
 go 1.15
 
 require (

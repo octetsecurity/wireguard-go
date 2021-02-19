@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2020 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  */
 
 package device
@@ -16,10 +16,6 @@ import (
 	"github.com/octetsecurity/wireguard-go/conn"
 )
 
-const (
-	PeerRoutineNumber = 2
-)
-
 type Peer struct {
 	isRunning                   AtomicBool
 	sync.RWMutex                // Mostly protects endpoint, but is generally taken whenever we modify peer
@@ -28,6 +24,8 @@ type Peer struct {
 	device                      *Device
 	endpoint                    conn.Endpoint
 	persistentKeepaliveInterval uint32 // accessed atomically
+	firstTrieEntry              *trieEntry
+	stopping                    sync.WaitGroup // routines pending stop
 
 	// These fields are accessed with atomic operations, which must be
 	// 64-bit aligned even on 32-bit platforms. Go guarantees that an
@@ -53,35 +51,25 @@ type Peer struct {
 		sentLastMinuteHandshake AtomicBool
 	}
 
-	signals struct {
-		newKeypairArrived chan struct{}
-		flushNonceQueue   chan struct{}
+	state struct {
+		sync.Mutex // protects against concurrent Start/Stop
 	}
 
 	queue struct {
-		sync.RWMutex
-		nonce                           chan *QueueOutboundElement // nonce / pre-handshake queue
-		outbound                        chan *QueueOutboundElement // sequential ordering of work
-		inbound                         chan *QueueInboundElement  // sequential ordering of work
-		packetInNonceQueueIsAwaitingKey AtomicBool
-	}
-
-	routines struct {
-		sync.Mutex                // held when stopping routines
-		stopping   sync.WaitGroup // routines pending stop
-		stop       chan struct{}  // size 0, stop all go routines in peer
+		staged   chan *QueueOutboundElement // staged packets before a handshake is available
+		outbound *autodrainingOutboundQueue // sequential ordering of udp transmission
+		inbound  *autodrainingInboundQueue  // sequential ordering of tun writing
 	}
 
 	cookieGenerator CookieGenerator
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
-	if device.isClosed.Get() {
+	if device.isClosed() {
 		return nil, errors.New("device closed")
 	}
 
 	// lock resources
-
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
@@ -89,29 +77,28 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	defer device.peers.Unlock()
 
 	// check if over limit
-
 	if len(device.peers.keyMap) >= MaxPeers {
 		return nil, errors.New("too many peers")
 	}
 
 	// create peer
-
 	peer := new(Peer)
 	peer.Lock()
 	defer peer.Unlock()
 
 	peer.cookieGenerator.Init(pk)
 	peer.device = device
+	peer.queue.outbound = newAutodrainingOutboundQueue(device)
+	peer.queue.inbound = newAutodrainingInboundQueue(device)
+	peer.queue.staged = make(chan *QueueOutboundElement, QueueStagedSize)
 
 	// map public key
-
 	_, ok := device.peers.keyMap[pk]
 	if ok {
 		return nil, errors.New("adding existing peer")
 	}
 
 	// pre-compute DH
-
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	handshake.precomputedStaticStatic = device.staticIdentity.privateKey.sharedSecret(pk)
@@ -119,17 +106,15 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	handshake.mutex.Unlock()
 
 	// reset endpoint
-
 	peer.endpoint = nil
 
 	// add
-
 	device.peers.keyMap[pk] = peer
 	device.peers.empty.Set(false)
 
 	// start peer
-
-	if peer.device.isUp.Get() {
+	peer.timersInit()
+	if peer.device.isUp() {
 		peer.Start()
 	}
 
@@ -143,7 +128,7 @@ func (peer *Peer) SendBuffer(buffer []byte) error {
 	if peer.device.net.bind == nil {
 		// Packets can leak through to SendBuffer while the device is closing.
 		// When that happens, drop them silently to avoid spurious errors.
-		if peer.device.isClosed.Get() {
+		if peer.device.isClosed() {
 			return nil
 		}
 		return errors.New("no bind")
@@ -173,48 +158,36 @@ func (peer *Peer) String() string {
 }
 
 func (peer *Peer) Start() {
-
 	// should never start a peer on a closed device
-
-	if peer.device.isClosed.Get() {
+	if peer.device.isClosed() {
 		return
 	}
 
 	// prevent simultaneous start/stop operations
-
-	peer.routines.Lock()
-	defer peer.routines.Unlock()
+	peer.state.Lock()
+	defer peer.state.Unlock()
 
 	if peer.isRunning.Get() {
 		return
 	}
 
 	device := peer.device
-	device.log.Debug.Println(peer, "- Starting...")
+	device.log.Verbosef("%v - Starting...", peer)
 
 	// reset routine state
+	peer.stopping.Wait()
+	peer.stopping.Add(2)
 
-	peer.routines.stopping.Wait()
-	peer.routines.stop = make(chan struct{})
-	peer.routines.stopping.Add(PeerRoutineNumber)
-
-	// prepare queues
-	peer.queue.Lock()
-	peer.queue.nonce = make(chan *QueueOutboundElement, QueueOutboundSize)
-	peer.queue.outbound = make(chan *QueueOutboundElement, QueueOutboundSize)
-	peer.queue.inbound = make(chan *QueueInboundElement, QueueInboundSize)
-	peer.queue.Unlock()
-
-	peer.timersInit()
+	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
-	peer.signals.newKeypairArrived = make(chan struct{}, 1)
-	peer.signals.flushNonceQueue = make(chan struct{}, 1)
+	peer.handshake.mutex.Unlock()
 
-	// wait for routines to start
+	peer.device.queue.encryption.wg.Add(1) // keep encryption queue open for our writes
 
-	// RoutineNonce writes to the encryption queue; keep it alive until we are done.
-	device.queue.encryption.wg.Add(1)
-	go peer.RoutineNonce()
+	peer.timersStart()
+
+	device.flushInboundQueue(peer.queue.inbound)
+	device.flushOutboundQueue(peer.queue.outbound)
 	go peer.RoutineSequentialSender()
 	go peer.RoutineSequentialReceiver()
 
@@ -244,7 +217,7 @@ func (peer *Peer) ZeroAndFlushAll() {
 	handshake.Clear()
 	handshake.mutex.Unlock()
 
-	peer.FlushNonceQueue()
+	peer.FlushStagedPackets()
 }
 
 func (peer *Peer) ExpireCurrentKeypairs() {
@@ -268,31 +241,21 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 }
 
 func (peer *Peer) Stop() {
-
-	// prevent simultaneous start/stop operations
+	peer.state.Lock()
+	defer peer.state.Unlock()
 
 	if !peer.isRunning.Swap(false) {
 		return
 	}
 
-	peer.routines.Lock()
-	defer peer.routines.Unlock()
-
-	peer.device.log.Debug.Println(peer, "- Stopping...")
+	peer.device.log.Verbosef("%v - Stopping...", peer)
 
 	peer.timersStop()
-
-	// stop & wait for ongoing peer routines
-
-	close(peer.routines.stop)
-	peer.routines.stopping.Wait()
-
-	// close queues
-
-	peer.queue.Lock()
-	close(peer.queue.nonce)
-	close(peer.queue.inbound)
-	peer.queue.Unlock()
+	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
+	peer.queue.inbound.c <- nil
+	peer.queue.outbound.c <- nil
+	peer.stopping.Wait()
+	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
 	peer.ZeroAndFlushAll()
 }

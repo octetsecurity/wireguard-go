@@ -2,7 +2,7 @@
 
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2020 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  */
 
 package device
@@ -10,9 +10,10 @@ package device
 /* Fit within memory limits for iOS's Network Extension API, which has stricter requirements */
 
 const (
-	QueueOutboundSize          = 1024
-	QueueInboundSize           = 1024
-	QueueHandshakeSize         = 1024
+	QueueStagedSize            = 64
+	QueueOutboundSize          = 64
+	QueueInboundSize           = 64
+	QueueHandshakeSize         = 64
 	MaxSegmentSize             = 1700
-	PreallocatedBuffersPerPool = 1024
+	PreallocatedBuffersPerPool = 64
 )

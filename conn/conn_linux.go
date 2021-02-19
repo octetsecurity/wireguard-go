@@ -2,7 +2,7 @@
 
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2020 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
  */
 
 package conn
@@ -104,7 +104,11 @@ func createBind(port uint16) (Bind, uint16, error) {
 	var err error
 	var bind nativeBind
 	var newPort uint16
+	var tries int
+	originalPort := port
 
+again:
+	port = originalPort
 	// Attempt ipv6 bind, update port if successful.
 	bind.sock6, newPort, err = create6(port)
 	if err != nil {
@@ -118,6 +122,11 @@ func createBind(port uint16) (Bind, uint16, error) {
 	// Attempt ipv4 bind, update port if successful.
 	bind.sock4, newPort, err = create4(port)
 	if err != nil {
+		if originalPort == 0 && err == syscall.EADDRINUSE && tries < 100 {
+			unix.Close(bind.sock6)
+			tries++
+			goto again
+		}
 		if err != syscall.EAFNOSUPPORT {
 			unix.Close(bind.sock6)
 			return nil, 0, err
